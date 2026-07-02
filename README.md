@@ -102,6 +102,10 @@ FastStream/
 ├── exemplo_00.py        # Basic example: subscriber with Pydantic validation
 ├── exemplo_01.py        # Chaining: handler_a → topic_b → handler_b
 ├── exemplo_02.py        # Cycle: topic_a → topic_b → topic_c → topic_a
+├── chat_backend.py      # FastStream/Redis backend (GUI-agnostic)
+├── chat_gui.py          # Tkinter chat window (no FastStream imports)
+├── chat_controller.py   # Tray icon + in-app notification popup + unread counter
+├── chat.py              # CLI entry point: `python chat.py alice|bob`
 ├── test.py              # Tests with TestRedisBroker
 ├── .gitignore           # Files ignored by Git
 └── README.md            # This file
@@ -346,6 +350,89 @@ The injected `logger: Logger` is FastStream's built-in logger, pre-configured wi
 
 ---
 
+## 💬 Chat Interface (Two Windows over Redis)
+
+A small Tkinter chat that lets two users exchange messages through FastStream/Redis. The interface, the messaging layer, and the notification/tray logic are kept in separate files so each layer can be reasoned about (and tested) in isolation.
+
+### Files
+
+| File | Responsibility |
+| --- | --- |
+| `chat_backend.py` | Owns the `RedisBroker`, the asyncio loop, and a thread-safe `queue.Queue` of incoming messages. Exposes a tiny API: `start()`, `send(recipient, text)`, `messages`. |
+| `chat_gui.py` | Tkinter window (pure GUI). Calls `backend.send(...)` on user input, polls `backend.messages` to render incoming lines, tracks sent/received counters, and exposes `show()` / `withdraw()` lifecycle hooks. **No FastStream/Redis imports.** |
+| `chat_controller.py` | Owns the **system tray icon** and the **in-app notification popup**. Keeps an unread counter that grows while the window is hidden and resets when the window is shown. The popup itself grows in size with the unread count. |
+| `chat.py` | CLI entry point. Wires a `ChatBackend` to a `ChatWindow` via a `ChatController`, then runs the Tkinter main loop. |
+
+### Install the GUI dependencies
+
+```bash
+pip install plyer pystray Pillow
+```
+
+- `plyer` — cross-platform desktop notifications (imported lazily; the GUI still works without it).
+- `pystray` + `Pillow` — system tray icon with Show / Quit menu (also imported lazily).
+
+### Run two windows
+
+Open two terminals, activate the venv in each, and run:
+
+**Terminal 1:**
+```bash
+python chat.py alice
+```
+
+**Terminal 2:**
+```bash
+python chat.py bob
+```
+
+A window titled `Chat — alice` opens in the first terminal and `Chat — bob` in the second. Each window shows a counter in the top-right corner: `Sent: 0   Received: 0`. Type a message in one window, press Enter, and it appears in the other window.
+
+### Hide, unread counter, and growing popup
+
+Clicking the window's close button (the `×`) **hides** the window instead of quitting. The application keeps running in the background, with the **tray icon** as the entry point. To exit, right-click the tray icon and choose **Quit**.
+
+- While the window is hidden, every incoming message increments an **unread counter**.
+- A dark in-app **notification popup** slides into the bottom-right corner of the screen. Its width grows as more unread messages accumulate (capped so it never exceeds the screen width).
+- The window's **title bar** also shows the unread count: `Chat — bob (3 unread)`.
+- Showing the window (via the tray's "Show" entry, or by clicking the popup) **resets the unread counter** and dismisses the popup.
+
+```
+   ┌─────────────────┐                       ┌─────────────────┐
+   │   chat_gui.py   │   backend.send(...)   │ chat_backend.py │
+   │   (Tk thread)   │ ────────────────────▶ │  (asyncio thr.) │
+   │                 │                       │                 │
+   │   _drain ───────┼──────────────────────▶│  RedisBroker    │
+   │      │          │      queue.Queue      │                 │
+   │      ▼          │                       └────────┬────────┘
+   │   ChatWindow    │                                │
+   │   (with hooks)  │                                ▼
+   └────────┬────────┘                          ┌──────────┐
+            │ hooks: _on_incoming, _on_focus    │  Redis   │
+            ▼                                   └──────────┘
+   ┌─────────────────┐
+   │chat_controller.py│  owns tray icon, unread counter,
+   │                 │  in-app notification popup
+   └─────────────────┘
+```
+
+- The GUI thread is the Tkinter main loop. It never touches asyncio.
+- The backend thread runs its own asyncio event loop and a single `RedisBroker` connection.
+- The controller and the window communicate through two simple hooks: `window._on_incoming(msg)` and `window._on_focus()`. The window does not know a controller exists; the controller is plugged in by the CLI.
+- Each user has a dedicated Redis channel: `chat:to:alice` and `chat:to:bob`. The wire format is `"<sender>::<text>"` — simple, easy to inspect with `redis-cli`.
+
+### Try it from the command line too
+
+You can also poke the system from outside the GUI. In a third terminal:
+
+```bash
+redis-cli publish chat:to:bob 'cli::hello from redis-cli'
+```
+
+You will see `bob: hello from redis-cli` appear in Bob's window. If Bob's window is hidden at the moment, the unread counter goes up and the popup grows accordingly.
+
+---
+
 ## 🧪 Running the Tests
 
 ```bash
@@ -381,6 +468,8 @@ The `test.py` file contains two tests for `exemplo_00.py` that use `TestRedisBro
 | `faststream run exemplo_00:app` | Runs example 00 |
 | `faststream run exemplo_01:app` | Runs example 01 |
 | `faststream run exemplo_02:app` | Runs example 02 |
+| `python chat.py alice` | Opens Alice's chat window |
+| `python chat.py bob` | Opens Bob's chat window |
 | `pytest test.py -v` | Runs the tests with verbose output |
 | `redis-cli ping` | Checks if Redis is alive |
 | `redis-cli publish <channel> "<message>"` | Publishes a message to a channel |
